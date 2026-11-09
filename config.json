@@ -8,5 +8,8 @@
   "temperature": 0.3,
   "max_tokens": 1200,
   "font_size": 11,
+  "theme": "auto",
+  "length": "standard",
+  "auto_unload_minutes": 0,
   "system_prompt": "You are a concise explainer. The user highlighted some text in another program and wants to understand it. First give a one-line plain-language meaning. Then explain it clearly in a short paragraph or a few bullet points: definition, context, and an example if useful. If it is code, explain what it does. If it is in a foreign language, translate it and explain it. If it is a technical or academic term, give the field it belongs to. Do not repeat the text back in full. Use plain text, not markdown tables."
 }

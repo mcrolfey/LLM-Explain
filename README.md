@@ -33,7 +33,10 @@ Use **tray icon → Open config.json** to edit it.
 | Ctrl + Right-click | Copy the highlighted text and explain it (the program's own right-click menu is suppressed) |
 | Ctrl+Alt+E | Same, from the keyboard |
 | Tray icon → Explain clipboard text | Explain whatever is already on the clipboard |
+| In popup: Brief / Standard / Detailed | Change the answer length; it regenerates and is remembered (also Ctrl+1/2/3) |
 | In popup: type + Enter | Ask a follow-up |
+| In popup: Regenerate / Copy | Ask again / copy the last answer |
+| In popup: Unload model (or tray → Unload model from LM Studio) | Unload the model from LM Studio to free memory; it reloads on the next question |
 | Esc | Close the popup |
 
 Plain right-click (without Ctrl) works normally everywhere.
@@ -44,6 +47,9 @@ Plain right-click (without Ctrl) works normally everywhere.
 - `fallback_model`: the model to load when none is loaded. `google/gemma-4-e4b` is fast.
 - `hotkey`: pynput format, e.g. `<ctrl>+<shift>+<space>`. Set `""` to disable.
 - `ctrl_right_click`: `false` to use only the hotkey.
+- `length`: `brief`, `standard` or `detailed` (the popup switch also saves this).
+- `theme`: `auto` (follow Windows light/dark), `light` or `dark`.
+- `auto_unload_minutes`: unload the model automatically after this many idle minutes (only for models this tool loads). `0` = LM Studio's default.
 - `restore_clipboard`: put your previous clipboard text back after grabbing the selection.
 - `system_prompt`: change the style of the explanations (e.g. "answer in Spanish", "assume a PhD-level reader").
 
