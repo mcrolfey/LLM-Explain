@@ -30,8 +30,13 @@ from tkinter import font as tkfont
 import pyperclip
 from pynput import keyboard, mouse
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe
+# config.json lives next to the .exe (or next to this script when run with Python)
+HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
+# bundled read-only files (icon) live in the PyInstaller temp dir when frozen
+RES = getattr(sys, "_MEIPASS", HERE)
 CONFIG_PATH = os.path.join(HERE, "config.json")
+ICON_ICO = os.path.join(RES, "icon.ico")
 
 DEFAULT_CONFIG = {
     "base_url": "http://localhost:1234",
@@ -43,17 +48,39 @@ DEFAULT_CONFIG = {
     "temperature": 0.3,
     "max_tokens": 1200,
     "font_size": 11,
-    "system_prompt": "Explain the highlighted text clearly and concisely.",
+    "system_prompt": (
+        "You are a concise explainer. The user highlighted some text in another program and "
+        "wants to understand it. First give a one-line plain-language meaning. Then explain it "
+        "clearly in a short paragraph or a few bullet points: definition, context, and an example "
+        "if useful. If it is code, explain what it does. If it is in a foreign language, translate "
+        "it and explain it. If it is a technical or academic term, give the field it belongs to. "
+        "Do not repeat the text back in full. Use plain text, not markdown tables."
+    ),
 }
+
+CONFIG_ERROR = None
+
+
+def hotkey_label(hk):
+    """'<ctrl>+<alt>+e' -> 'Ctrl+Alt+E'"""
+    return "+".join(p.strip("<>").capitalize() if len(p.strip("<>")) > 1 else p.upper()
+                    for p in (hk or "").split("+")) or "(no hotkey)"
 
 
 def load_config():
+    global CONFIG_ERROR
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
     except FileNotFoundError:
-        pass
+        try:  # first run: write a config the user can edit
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+        except OSError:
+            pass
+    except json.JSONDecodeError as e:
+        CONFIG_ERROR = f"config.json has an error and was ignored (defaults used):\n{e}"
     cfg["base_url"] = cfg["base_url"].rstrip("/")
     return cfg
 
@@ -452,6 +479,8 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
+        if os.path.exists(ICON_ICO):
+            self.root.iconbitmap(default=ICON_ICO)  # icon for every popup window
         self.ui_q = queue.Queue()
         self.trigger_q = queue.Queue()
         self._rclick_swallowed = False
@@ -464,6 +493,16 @@ class App:
             self._start_mouse_hook()
         self._start_tray()
         self.root.after(50, self._poll)
+        self.root.after(300, self._startup_notice)
+
+    def _startup_notice(self):
+        """The app lives in the tray, so show briefly that launching worked."""
+        left, top, right, bottom = work_area_at(*cursor_pos())
+        msg = (f"LLM Explain is running.\nHighlight text, then Ctrl + Right-click "
+               f"(or {hotkey_label(CFG.get('hotkey'))}).\nQuit from the tray icon.")
+        if CONFIG_ERROR:
+            msg += "\n\n" + CONFIG_ERROR
+        self._toast(msg, right - 20, bottom - 20, ms=6000 if CONFIG_ERROR else 3500, anchor_br=True)
 
     def _trigger_worker(self):
         while True:
@@ -512,18 +551,16 @@ class App:
             from PIL import Image, ImageDraw
         except ImportError:
             return
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse((4, 4, 60, 60), fill=(26, 95, 180, 255))
         try:
-            from PIL import ImageFont
-            fnt = ImageFont.truetype("segoeuib.ttf", 40)
-        except Exception:
-            fnt = None
-        d.text((32, 32), "?", fill="white", font=fnt, anchor="mm")
+            img = Image.open(ICON_ICO)
+        except Exception:  # icon missing: draw a simple blue "?"
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse((4, 4, 60, 60), fill=(26, 95, 180, 255))
+            d.text((32, 32), "?", fill="white", anchor="mm")
         menu = pystray.Menu(
             pystray.MenuItem("Explain clipboard text", lambda: self.trigger_q.put("clipboard")),
-            pystray.MenuItem(f"Trigger: Ctrl+Right-click or {CFG.get('hotkey')}", None, enabled=False),
+            pystray.MenuItem(f"Trigger: Ctrl+Right-click or {hotkey_label(CFG.get('hotkey'))}", None, enabled=False),
             pystray.MenuItem("Open config.json", lambda: os.startfile(CONFIG_PATH)),
             pystray.MenuItem("Quit", lambda: self.ui_q.put(("quit",))),
         )
@@ -546,13 +583,18 @@ class App:
             pass
         self.root.after(50, self._poll)
 
-    def _toast(self, msg, x, y):
+    def _toast(self, msg, x, y, ms=1800, anchor_br=False):
         tw = tk.Toplevel(self.root)
         tw.overrideredirect(True)
         tw.attributes("-topmost", True)
-        tk.Label(tw, text=msg, bg="#333", fg="white", padx=10, pady=6).pack()
+        tk.Label(tw, text=msg, bg="#333", fg="white", padx=12, pady=8, justify="left").pack()
+        if anchor_br:  # (x, y) is the bottom-right corner
+            tw.update_idletasks()
+            x, y = x - tw.winfo_reqwidth() - 12, y - tw.winfo_reqheight() - 12
         tw.geometry(f"+{x + 12}+{y + 12}")
-        tw.after(1800, tw.destroy)
+        tw.deiconify()
+        tw.bind("<Button-1>", lambda e: tw.destroy())
+        tw.after(ms, tw.destroy)
 
     def quit(self):
         if self.tray:

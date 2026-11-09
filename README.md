@@ -1,5 +1,7 @@
 # LLM Explain
 
+<img src="icon.png" width="96" align="right">
+
 Highlight text in any Windows program, then **Ctrl + Right-click** (or press **Ctrl+Alt+E**).
 A popup near the mouse explains the text using a local model in LM Studio. You can type
 follow-up questions in the popup.
@@ -9,10 +11,20 @@ follow-up questions in the popup.
 1. In LM Studio, open the **Developer** tab and start the server (default `http://localhost:1234`).
    You don't need to load a model first. The tool uses the loaded model if there is one;
    otherwise LM Studio loads `fallback_model` on the first request.
-2. Install Python 3.10+ and the dependencies:
-   `python -m pip install -r requirements.txt`
-3. Double-click `start_llm_explain.bat`. A blue **?** icon appears in the system tray.
-4. Optional: run `add_to_startup.bat` once so the tool starts when you log in.
+2. Install Python 3.10+, then build and install the program (one time):
+   ```
+   build_exe.bat
+   powershell -ExecutionPolicy Bypass -File install.ps1
+   ```
+   This puts `LLM Explain.exe` in `%LOCALAPPDATA%\Programs\LLM Explain` and creates an
+   **LLM Explain** icon on your desktop. Add `-Startup` to the install command to also start it at login.
+3. Double-click the desktop icon. A notice confirms it's running, and its icon appears in the system tray.
+
+The installed program reads `config.json` from its own folder (`%LOCALAPPDATA%\Programs\LLM Explain`).
+Use **tray icon → Open config.json** to edit it.
+
+**Run from source instead:** `python -m pip install -r requirements.txt`, then double-click
+`start_llm_explain.bat` (and optionally `add_to_startup.bat`).
 
 ## Use
 
