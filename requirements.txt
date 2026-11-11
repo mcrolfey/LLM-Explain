@@ -1,5 +1,11 @@
-pynput
-pyperclip
-pystray
 pillow
 anthropic
+# Windows
+pynput; sys_platform == "win32"
+pyperclip; sys_platform == "win32"
+pystray; sys_platform == "win32"
+# macOS
+pyobjc-framework-Cocoa; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices; sys_platform == "darwin"
+keyring; sys_platform == "darwin"

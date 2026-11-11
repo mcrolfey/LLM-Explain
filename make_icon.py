@@ -1,5 +1,9 @@
-"""Generates icon.ico (and icon.png preview) for LLM Explain: a highlighted line of text
-with a speech bubble containing a question mark."""
+"""Generates the LLM Explain icons: a highlighted line of text with a speech bubble containing
+a question mark.
+  icon.ico           Windows program / tray icon
+  icon.png           preview
+  icon.icns          macOS app icon
+  icon_menubar.png   macOS menu bar icon (black + transparency; macOS tints it)"""
 import os
 from PIL import Image, ImageDraw, ImageFont
 
@@ -8,7 +12,9 @@ S = 1024  # draw large, downsample for crisp small sizes
 
 
 def font(size):
-    for name in ("segoeuib.ttf", "arialbd.ttf"):
+    for name in ("segoeuib.ttf", "arialbd.ttf",
+                 "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                 "/System/Library/Fonts/Helvetica.ttc"):
         try:
             return ImageFont.truetype(name, size)
         except OSError:
@@ -47,9 +53,26 @@ def draw():
     return img
 
 
+def draw_menubar():
+    """Monochrome bubble with a "?" cut out, for the macOS menu bar (a template image)."""
+    img = Image.new("L", (S, S), 0)
+    d = ImageDraw.Draw(img)
+    d.ellipse((90, 70, 934, 830), fill=255)
+    d.polygon([(250, 740), (150, 980), (480, 810)], fill=255)
+    d.text((512, 470), "?", font=font(640), fill=0, anchor="mm")
+    out = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    out.putalpha(img)
+    return out.resize((36, 36), Image.LANCZOS)  # shown at 18x18 points (sharp on Retina)
+
+
 if __name__ == "__main__":
     big = draw()
     big.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, "icon.png"))
     big.save(os.path.join(HERE, "icon.ico"),
              sizes=[(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64), (128, 128), (256, 256)])
-    print("wrote icon.ico and icon.png")
+    # macOS app icons sit inside a ~10% margin on a 1024 canvas
+    mac = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    mac.paste(big.resize((824, 824), Image.LANCZOS), (100, 100))
+    mac.save(os.path.join(HERE, "icon.icns"))
+    draw_menubar().save(os.path.join(HERE, "icon_menubar.png"))
+    print("wrote icon.ico, icon.png, icon.icns and icon_menubar.png")

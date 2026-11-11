@@ -1,24 +1,27 @@
 """
-LLM Explain: highlight text in any Windows program, then press Ctrl + Right-click
-(or the hotkey, default Ctrl+Alt+E) to get an explanation from a local LM Studio model.
+LLM Explain: highlight text in any Windows or macOS program, then press Ctrl + Right-click
+(or the hotkey, default Ctrl+Alt+E, on a Mac Control+Option+E) to get an explanation from a
+local LM Studio model or any model API you add in Settings.
 
 How it works
-  1. A low-level mouse hook watches for Ctrl + Right-click and swallows that click,
-     so the program under the mouse does not open its own context menu.
-  2. The tool sends Ctrl+C to the foreground program to copy the highlighted text,
-     reads it from the clipboard, then puts your previous clipboard text back.
-  3. The text goes to LM Studio's OpenAI-compatible server (/v1/chat/completions)
-     and the answer streams into a small popup near the mouse. You can ask follow-ups.
+  1. A global hook watches for Ctrl + Right-click and swallows that click, so the program
+     under the mouse does not open its own context menu. (Windows: low-level mouse hook;
+     macOS: Quartz event tap, which needs the Accessibility permission.)
+  2. The tool sends Ctrl+C (Cmd+C on a Mac) to the foreground program to copy the highlighted
+     text, reads it from the clipboard, then puts your previous clipboard back.
+  3. The text goes to the model's streaming chat API and the answer streams into a small
+     window near the mouse. You can ask follow-ups.
 
-Run with pythonw.exe (no console) via start_llm_explain.bat. Quit from the tray icon.
+Platform-specific code lives in win_support.py and mac_support.py.
+Windows: run with pythonw.exe (no console) via start_llm_explain.bat. Quit from the tray icon.
+macOS: run start_llm_explain.command, or build the app with build_mac.sh. Quit from the menu bar.
 """
 
-import ctypes
-import ctypes.wintypes as wt
 import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -27,16 +30,22 @@ import urllib.request
 import tkinter as tk
 from tkinter import font as tkfont
 
-import pyperclip
-from pynput import keyboard, mouse
+IS_MAC = sys.platform == "darwin"
+if IS_MAC:
+    import mac_support as plat
+else:
+    import win_support as plat
 
-FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe
-# config.json lives next to the .exe (or next to this script when run with Python)
+FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe / .app
+# config.json lives next to the .exe (or next to this script when run with Python).
+# The Mac app keeps it in ~/Library/Application Support/LLM Explain (the .app is read-only).
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 # bundled read-only files (icon) live in the PyInstaller temp dir when frozen
 RES = getattr(sys, "_MEIPASS", HERE)
-CONFIG_PATH = os.path.join(HERE, "config.json")
-ICON_ICO = os.path.join(RES, "icon.ico")
+CONFIG_DIR = plat.SUPPORT_DIR if (IS_MAC and FROZEN) else HERE
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+# Windows: .ico for the tray and windows. macOS: monochrome menu bar template image.
+ICON_PATH = os.path.join(RES, "icon_menubar.png" if IS_MAC else "icon.ico")
 
 DEFAULT_CONFIG = {
     "base_url": "http://localhost:1234",
@@ -67,12 +76,6 @@ DEFAULT_CONFIG = {
 CONFIG_ERROR = None
 
 
-def hotkey_label(hk):
-    """'<ctrl>+<alt>+e' -> 'Ctrl+Alt+E'"""
-    return "+".join(p.strip("<>").capitalize() if len(p.strip("<>")) > 1 else p.upper()
-                    for p in (hk or "").split("+")) or "(no hotkey)"
-
-
 def load_config():
     global CONFIG_ERROR
     cfg = dict(DEFAULT_CONFIG)
@@ -81,9 +84,16 @@ def load_config():
             cfg.update(json.load(f))
     except FileNotFoundError:
         try:  # first run: write a config the user can edit
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CONFIG, f, indent=2)
-        except OSError:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            bundled = os.path.join(RES, "config.json")
+            if os.path.abspath(bundled) != os.path.abspath(CONFIG_PATH) and os.path.exists(bundled):
+                shutil.copyfile(bundled, CONFIG_PATH)  # Mac app: start from the shipped config
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg.update(json.load(f))
+            else:
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(DEFAULT_CONFIG, f, indent=2)
+        except (OSError, json.JSONDecodeError):
             pass
     except json.JSONDecodeError as e:
         CONFIG_ERROR = f"config.json has an error and was ignored (defaults used):\n{e}"
@@ -95,98 +105,12 @@ def load_config():
 
 CFG = load_config()
 
-# ---------------------------------------------------------------- Win32 helpers
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-
-VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN = 0x10, 0x11, 0x12, 0x5B, 0x5C
-WM_RBUTTONDOWN, WM_RBUTTONUP = 0x0204, 0x0205
-
-
-def key_down(vk):
-    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
-
-
-def cursor_pos():
-    pt = wt.POINT()
-    user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x, pt.y
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
-                ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
-
-
-def work_area_at(x, y):
-    """Usable screen rectangle (excluding taskbar) of the monitor containing (x, y)."""
-    user32.MonitorFromPoint.restype = wt.HANDLE
-    user32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
-    hmon = user32.MonitorFromPoint(wt.POINT(x, y), 2)  # MONITOR_DEFAULTTONEAREST
-    mi = MONITORINFO()
-    mi.cbSize = ctypes.sizeof(MONITORINFO)
-    user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
-    r = mi.rcWork
-    return r.left, r.top, r.right, r.bottom
-
-
-def single_instance_or_exit():
-    kernel32.CreateMutexW(None, False, "Local\\LLMExplainSingleInstance")
-    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        user32.MessageBoxW(None, "LLM Explain is already running (check the tray).",
-                           "LLM Explain", 0x40)
-        sys.exit(0)
-
-
-# ------------------------------------------------------------ grab selection
-_kb = keyboard.Controller()
-
-
-def copy_selection():
-    """Copy the current selection of the foreground program and return it."""
-    # Wait for the user to let go of Alt/Shift/Win (from the hotkey), otherwise the
-    # target program would see Ctrl+Alt+C instead of Ctrl+C.
-    deadline = time.time() + 2.0
-    while time.time() < deadline and any(key_down(k) for k in (VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)):
-        time.sleep(0.02)
-
-    try:
-        old = pyperclip.paste()
-    except Exception:
-        old = ""
-    seq = user32.GetClipboardSequenceNumber()
-
-    _kb.press(keyboard.Key.ctrl)
-    _kb.press("c")
-    _kb.release("c")
-    _kb.release(keyboard.Key.ctrl)
-
-    text = ""
-    deadline = time.time() + 0.8
-    while time.time() < deadline:
-        time.sleep(0.03)
-        if user32.GetClipboardSequenceNumber() != seq:
-            time.sleep(0.05)  # let the owner finish writing
-            try:
-                text = pyperclip.paste()
-            except Exception:
-                text = ""
-            break
-
-    if CFG.get("restore_clipboard", True) and text and old:
-        try:
-            pyperclip.copy(old)
-        except Exception:
-            pass
-    return (text or "").strip()
-
-
 # ------------------------------------------------------------------ providers
 # A provider is a dict: {"name", "type", "base_url", "model", optional "api_key_env", "effort"}
 #   type "lmstudio":  LM Studio (root URL, e.g. http://localhost:1234). Auto model, unload, TTL.
 #   type "openai":    any OpenAI-compatible API (base URL incl. version, e.g. .../v1).
 #   type "anthropic": Claude through the official Anthropic SDK.
-# API keys are kept in Windows Credential Manager, never in config.json.
+# API keys are kept in Windows Credential Manager / the macOS Keychain, never in config.json.
 PROVIDER_TYPES = {"lmstudio": "LM Studio", "openai": "OpenAI-compatible", "anthropic": "Anthropic (Claude)"}
 
 PRESETS = [
@@ -235,57 +159,11 @@ def lmstudio_provider():
     return next((q for q in providers() if q.get("type") == "lmstudio"), None)
 
 
-# ---- API keys in Windows Credential Manager
-class _CREDENTIAL(ctypes.Structure):
-    _fields_ = [("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR),
-                ("Comment", wt.LPWSTR), ("LastWritten", wt.FILETIME),
-                ("CredentialBlobSize", wt.DWORD), ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
-                ("Persist", wt.DWORD), ("AttributeCount", wt.DWORD), ("Attributes", ctypes.c_void_p),
-                ("TargetAlias", wt.LPWSTR), ("UserName", wt.LPWSTR)]
-
-
-_advapi32 = ctypes.windll.advapi32
-_CRED_GENERIC, _CRED_PERSIST_LOCAL = 1, 2
-
-
-def _cred_target(provider_name):
-    return f"LLM Explain/{provider_name}"
-
-
-def key_get(provider_name):
-    p = ctypes.POINTER(_CREDENTIAL)()
-    if not _advapi32.CredReadW(_cred_target(provider_name), _CRED_GENERIC, 0, ctypes.byref(p)):
-        return ""
-    try:
-        c = p.contents
-        return ctypes.string_at(c.CredentialBlob, c.CredentialBlobSize).decode("utf-16-le")
-    finally:
-        _advapi32.CredFree(p)
-
-
-def key_set(provider_name, secret):
-    blob = secret.encode("utf-16-le")
-    buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
-    c = _CREDENTIAL()
-    c.Type = _CRED_GENERIC
-    c.TargetName = _cred_target(provider_name)
-    c.CredentialBlobSize = len(blob)
-    c.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))
-    c.Persist = _CRED_PERSIST_LOCAL
-    c.UserName = "LLM Explain"
-    if not _advapi32.CredWriteW(ctypes.byref(c), 0):
-        raise ctypes.WinError()
-
-
-def key_delete(provider_name):
-    _advapi32.CredDeleteW(_cred_target(provider_name), _CRED_GENERIC, 0)
-
-
 def api_key(prov):
     """Saved key, else the environment variable named in "api_key_env" (if any)."""
     if prov.get("_key"):  # typed in Settings but not saved yet (Test / Fetch)
         return prov["_key"]
-    k = key_get(prov.get("name", ""))
+    k = plat.key_get(prov.get("name", ""))
     if not k and prov.get("api_key_env"):
         k = os.environ.get(prov["api_key_env"], "")
     return k
@@ -498,11 +376,6 @@ def loaded_models(base=None):
             for m in data.get("models", []) for inst in m.get("loaded_instances", [])]
 
 
-def _lms_cli():
-    path = os.path.join(os.path.expanduser("~"), ".lmstudio", "bin", "lms.exe")
-    return path if os.path.exists(path) else None
-
-
 def unload_models():
     """Unload every model loaded in LM Studio. Returns a short message for the user."""
     prov = lmstudio_provider()
@@ -515,12 +388,12 @@ def unload_models():
         if e.code != 404:
             raise
         # Older LM Studio without the /api/v1 REST API: use its command-line tool
-        lms = _lms_cli()
+        lms = plat.lms_cli()
         if not lms:
             return "This LM Studio version can't unload remotely. Update LM Studio."
         import subprocess
         subprocess.run([lms, "unload", "--all"], capture_output=True, timeout=60,
-                       creationflags=0x08000000)  # CREATE_NO_WINDOW
+                       **plat.SUBPROCESS_FLAGS)  # no console window on Windows
         return "Unloaded all models."
     if not loaded:
         return "No model is loaded in LM Studio."
@@ -583,21 +456,11 @@ THEMES = {
 }
 
 
-def system_dark_mode():
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
-            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
-    except OSError:
-        return False
-
-
 def current_theme():
     """Returns (palette, is_dark). config "theme": "auto" | "light" | "dark"."""
     name = CFG.get("theme", "auto")
     if name not in THEMES:
-        name = "dark" if system_dark_mode() else "light"
+        name = "dark" if plat.system_dark_mode() else "light"
     return THEMES[name], name == "dark"
 
 
@@ -619,29 +482,6 @@ def save_setting(key, value):
         pass
 
 
-def style_titlebar(win, pal, dark):
-    """Windows 11: dark/light title bar coloured like the window, rounded corners."""
-    try:
-        win.update_idletasks()
-        hwnd = wt.HWND(int(win.wm_frame(), 16))
-        dwm = ctypes.windll.dwmapi
-
-        def set_attr(attr, val):
-            v = ctypes.c_int(val)
-            dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
-
-        def colorref(h):
-            return int(h[1:3], 16) | int(h[3:5], 16) << 8 | int(h[5:7], 16) << 16
-
-        set_attr(20, 1 if dark else 0)          # DWMWA_USE_IMMERSIVE_DARK_MODE
-        set_attr(33, 2)                         # DWMWA_WINDOW_CORNER_PREFERENCE: round
-        set_attr(34, colorref(pal["border"]))   # DWMWA_BORDER_COLOR
-        set_attr(35, colorref(pal["bg"]))       # DWMWA_CAPTION_COLOR
-        set_attr(36, colorref(pal["text"]))     # DWMWA_TEXT_COLOR
-    except Exception:
-        pass
-
-
 _FONT_FAMILIES = None
 
 
@@ -650,6 +490,28 @@ def pick_font(root, *names):
     if _FONT_FAMILIES is None:
         _FONT_FAMILIES = set(tkfont.families(root))
     return next((n for n in names if n in _FONT_FAMILIES), names[-1])
+
+
+MOD = "Command" if IS_MAC else "Control"  # shortcut modifier in Tk bindings (Cmd+W / Ctrl+W)
+MOD_STATE = 0x8 if IS_MAC else 0x4        # the same modifier in event.state
+# Tk 8.6 on macOS numbers the middle button 3 (and the right button 2)
+MIDDLE_BUTTON = "<Button-3>" if IS_MAC and tk.TkVersion < 8.7 else "<Button-2>"
+
+
+def ui_scale(widget):
+    """Pixels per Windows-96-dpi pixel. Tk on macOS already works in points: use 1:1."""
+    return 1.0 if IS_MAC else widget.winfo_fpixels("1i") / 96.0
+
+
+def ui_fonts(root):
+    """(text, display, mono) families and a size offset. Tk on macOS takes sizes as 72-dpi
+    points, so the same number looks ~25% smaller than on Windows; the offset evens it out."""
+    if IS_MAC:
+        system = tkfont.nametofont("TkDefaultFont").actual()["family"]  # San Francisco
+        return system, system, pick_font(root, "SF Mono", "Menlo", "Courier"), 3
+    return (pick_font(root, "Segoe UI Variable Text", "Segoe UI", "TkDefaultFont"),
+            pick_font(root, "Segoe UI Variable Display", "Segoe UI", "TkDefaultFont"),
+            pick_font(root, "Cascadia Mono", "Consolas", "Courier New"), 0)
 
 
 class FlatButton(tk.Label):
@@ -1001,20 +863,18 @@ class ExplainWindow:
             w.attributes("-topmost", True)
         w.protocol("WM_DELETE_WINDOW", self.hide)
         w.bind("<Escape>", lambda e: self.hide())
-        w.bind("<Control-w>", lambda e: self.active and self.close_tab(self.active))
-        w.bind("<Control-W>", lambda e: self.active and self.close_tab(self.active))
+        w.bind(f"<{MOD}-w>", lambda e: self.active and self.close_tab(self.active))
+        w.bind(f"<{MOD}-W>", lambda e: self.active and self.close_tab(self.active))
         w.bind("<Control-Tab>", lambda e: (self.cycle(1), "break")[1])
         w.bind("<Control-Shift-Tab>", lambda e: (self.cycle(-1), "break")[1])
         for i, k in enumerate(LENGTH_ORDER, 1):
-            w.bind(f"<Control-Key-{i}>", lambda e, k=k: self.set_length(k))
+            w.bind(f"<{MOD}-Key-{i}>", lambda e, k=k: self.set_length(k))
 
-        scale = w.winfo_fpixels("1i") / 96.0
+        scale = ui_scale(w)
         px = self.px = lambda v: max(1, int(round(v * scale)))
 
-        fs = CFG["font_size"]
-        ui = pick_font(root, "Segoe UI Variable Text", "Segoe UI", "TkDefaultFont")
-        ui_disp = pick_font(root, "Segoe UI Variable Display", "Segoe UI", "TkDefaultFont")
-        mono = pick_font(root, "Cascadia Mono", "Consolas", "Courier New")
+        ui, ui_disp, mono, offset = ui_fonts(root)
+        fs = CFG["font_size"] + offset
         self.f_body = tkfont.Font(family=ui, size=fs)
         self.f_bold = tkfont.Font(family=ui, size=fs, weight="bold")
         self.f_head = tkfont.Font(family=ui_disp, size=fs + 2, weight="bold")
@@ -1122,7 +982,7 @@ class ExplainWindow:
         t.tag_configure("muted", font=self.f_italic, foreground=p["muted"])
         t.tag_configure("error", foreground=p["error"])
         # read-only, but text can still be selected and copied
-        t.bind("<Key>", lambda e: None if (e.state & 0x4 and e.keysym.lower() in ("c", "a")) else "break")
+        t.bind("<Key>", lambda e: None if (e.state & MOD_STATE and e.keysym.lower() in ("c", "a")) else "break")
         return t
 
     # ---- tabs
@@ -1166,7 +1026,7 @@ class ExplainWindow:
         for wdg in (f, lbl, x):
             wdg.bind("<Enter>", enter)
             wdg.bind("<Leave>", leave)
-            wdg.bind("<Button-2>", lambda e, t=tab: self.close_tab(t))  # middle-click
+            wdg.bind(MIDDLE_BUTTON, lambda e, t=tab: self.close_tab(t))  # middle-click
         for wdg in (f, lbl):
             wdg.bind("<Button-1>", lambda e, t=tab: self.select(t))
         x.bind("<Button-1>", lambda e, t=tab: self.close_tab(t))
@@ -1320,7 +1180,7 @@ class ExplainWindow:
             ww, wh = w.winfo_reqwidth(), w.winfo_reqheight()
         else:
             ww, wh = w.winfo_width(), w.winfo_height()
-        left, top, right, bottom = work_area_at(x, y)
+        left, top, right, bottom = plat.work_area_at(x, y)
         nx = min(max(left, x + 16), right - ww - 8)
         ny = max(top, min(max(top, y + 16), bottom - wh - 40))
         # Fixing the size stops the window resizing when tabs change.
@@ -1335,8 +1195,9 @@ class ExplainWindow:
         w.deiconify()
         w.after(30, lambda: w.state("normal") if w.state() == "iconic" else None)
         if not self.styled:
-            style_titlebar(w, self.pal, self.dark)
+            plat.style_titlebar(w, self.pal, self.dark)
             self.styled = True
+        plat.activate_app()  # macOS: take focus from the app the text was selected in
         w.lift()
         w.focus_force()
         self.entry.focus_set()
@@ -1349,6 +1210,8 @@ class ExplainWindow:
 
     def hide(self):
         self.win.withdraw()
+        if not SettingsDialog.is_open():
+            plat.hide_app()  # macOS: hand focus back to the previous app
 
     def poll(self):
         for t in list(self.tabs):
@@ -1357,8 +1220,12 @@ class ExplainWindow:
 
 
 class SettingsDialog:
-    """Add, edit, test and delete model providers. API keys go to Windows Credential Manager."""
+    """Add, edit, test and delete model providers. API keys go to the OS keystore."""
     _open = None
+
+    @classmethod
+    def is_open(cls):
+        return bool(cls._open and cls._open.win.winfo_exists())
 
     TYPE_HINTS = {
         "lmstudio": "Local LM Studio server (root URL, no /v1). Leave the model empty to use "
@@ -1370,7 +1237,8 @@ class SettingsDialog:
     }
 
     def __init__(self, root, on_save=None):
-        if SettingsDialog._open and SettingsDialog._open.win.winfo_exists():
+        if SettingsDialog.is_open():
+            plat.activate_app()
             SettingsDialog._open.win.deiconify()
             SettingsDialog._open.win.lift()
             SettingsDialog._open.win.focus_force()
@@ -1390,11 +1258,10 @@ class SettingsDialog:
         w.attributes("-topmost", True)
         w.protocol("WM_DELETE_WINDOW", self.close)
         w.bind("<Escape>", lambda e: self.close())
-        scale = w.winfo_fpixels("1i") / 96.0
+        scale = ui_scale(w)
         px = self.px = lambda v: max(1, int(round(v * scale)))
-        fs = CFG["font_size"]
-        ui = pick_font(root, "Segoe UI Variable Text", "Segoe UI", "TkDefaultFont")
-        ui_disp = pick_font(root, "Segoe UI Variable Display", "Segoe UI", "TkDefaultFont")
+        ui, ui_disp, _mono, offset = ui_fonts(root)
+        fs = CFG["font_size"] + offset
         self.f = tkfont.Font(family=ui, size=fs - 1)
         self.f_b = tkfont.Font(family=ui, size=fs - 1, weight="bold")
         self.f_small = tkfont.Font(family=ui, size=fs - 2)
@@ -1487,11 +1354,12 @@ class SettingsDialog:
 
         w.update_idletasks()
         sw, sh = w.winfo_reqwidth() + px(70), w.winfo_reqheight()  # room for longer names
-        left_, top_, right_, bottom_ = work_area_at(*cursor_pos())
+        left_, top_, right_, bottom_ = plat.work_area_at(*plat.cursor_pos())
         # a fixed size stops the dialog jumping wider when another provider is selected
         w.geometry(f"{sw}x{sh}+{left_ + (right_ - left_ - sw) // 2}+{top_ + (bottom_ - top_ - sh) // 3}")
         w.deiconify()
-        style_titlebar(w, p, dark)
+        plat.style_titlebar(w, p, dark)
+        plat.activate_app()
         w.lift()
         w.focus_force()
         self._poll()
@@ -1547,18 +1415,18 @@ class SettingsDialog:
         self._commit()
         it = dict(self.items[self.cur])
         if not it.get("_key") and not it.get("_forget"):
-            it["_key"] = key_get(it.get("_orig") or it["name"])
+            it["_key"] = plat.key_get(it.get("_orig") or it["name"])
         return it
 
     def _key_note(self):
         it = self.items[self.cur]
-        saved = bool(key_get(it.get("_orig") or "")) and not it.get("_forget")
+        saved = bool(plat.key_get(it.get("_orig") or "")) and not it.get("_forget")
         if it.get("type") == "lmstudio":
             text = "Usually not needed for LM Studio."
         elif saved:
-            text = "A key is saved in Windows Credential Manager. Leave blank to keep it."
+            text = f"A key is saved in {plat.KEYSTORE}. Leave blank to keep it."
         else:
-            text = "Stored in Windows Credential Manager, not in config.json."
+            text = f"Stored in {plat.KEYSTORE}, not in config.json."
         self.key_note.config(text=text)
         if saved:
             self.forget_btn.pack(side="left", padx=self.px(6))
@@ -1701,19 +1569,19 @@ class SettingsDialog:
         try:
             for old in self.deleted:
                 if old not in names:
-                    key_delete(old)
+                    plat.key_delete(old)
             for it in self.items:
                 old, new = it.get("_orig"), it["name"]
                 if old and old != new:
                     renames[old] = new
-                    k = key_get(old)
+                    k = plat.key_get(old)
                     if k and not it.get("_forget"):
-                        key_set(new, k)
-                    key_delete(old)
+                        plat.key_set(new, k)
+                    plat.key_delete(old)
                 if it.get("_forget"):
-                    key_delete(new)
+                    plat.key_delete(new)
                 if it.get("_key"):
-                    key_set(new, it["_key"])
+                    plat.key_set(new, it["_key"])
         except OSError as e:
             self.status.config(text=f"Couldn't save the API key: {e}", fg=self.pal["error"])
             return
@@ -1748,19 +1616,24 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        if os.path.exists(ICON_ICO):
-            self.root.iconbitmap(default=ICON_ICO)  # icon for every popup window
+        plat.setup_tk(self.root, ICON_PATH)
+        if IS_MAC:
+            # Opening the app again from Finder/Launchpad shows the window; Cmd+Q quits cleanly
+            self.root.createcommand("::tk::mac::ReopenApplication", lambda *a: self.ui_q.put(("show",)))
+            self.root.createcommand("::tk::mac::Quit", lambda *a: self.ui_q.put(("quit",)))
         self.ui_q = queue.Queue()
         self.trigger_q = queue.Queue()
-        self._rclick_swallowed = False
-        self.mouse_listener = None
         self.tray = None
         self.window = None  # created on first lookup, then reused (tabs)
 
         threading.Thread(target=self._trigger_worker, daemon=True).start()
-        self._start_hotkey()
-        if CFG.get("ctrl_right_click", True):
-            self._start_mouse_hook()
+        self.triggers = plat.Triggers(CFG.get("hotkey"), CFG.get("ctrl_right_click", True),
+                                      lambda: self.trigger_q.put("selection"))
+        self.triggers_ok = self.triggers.start()
+        if not self.triggers_ok:
+            # macOS: no Accessibility permission yet. Ask once, then retry until it's granted.
+            self.triggers.has_permission(prompt=True)
+            self.root.after(2000, self._retry_triggers)
         self._start_tray()
         if any(p.get("type") == "anthropic" for p in providers()):
             # the Anthropic SDK takes ~2 s to import; load it now, not on the first lookup
@@ -1768,14 +1641,33 @@ class App:
         self.root.after(50, self._poll)
         self.root.after(300, self._startup_notice)
 
+    def _trigger_text(self):
+        hk = CFG.get("hotkey")
+        click = plat.TRIGGER_CLICK if CFG.get("ctrl_right_click", True) else ""
+        keys = plat.hotkey_label(hk) if hk else ""
+        return f"{click} (or {keys})" if click and keys else (click or keys or f"Explain clipboard text in the {plat.TRAY}")
+
     def _startup_notice(self):
-        """The app lives in the tray, so show briefly that launching worked."""
-        left, top, right, bottom = work_area_at(*cursor_pos())
-        msg = (f"LLM Explain is running.\nHighlight text, then Ctrl + Right-click "
-               f"(or {hotkey_label(CFG.get('hotkey'))}).\nQuit from the tray icon.")
+        """The app lives in the tray / menu bar, so show briefly that launching worked."""
+        msg = (f"LLM Explain is running.\nHighlight text, then {self._trigger_text()}."
+               f"\nQuit from the {plat.TRAY}.")
+        ms = 3500
+        if not self.triggers_ok:
+            msg += ("\n\nTo respond to the shortcut, LLM Explain needs Accessibility access:\n"
+                    "System Settings → Privacy & Security → Accessibility → turn it on.\n"
+                    "It starts working as soon as you do.")
+            ms = 12000
         if CONFIG_ERROR:
             msg += "\n\n" + CONFIG_ERROR
-        self._toast(msg, right - 20, bottom - 20, ms=6000 if CONFIG_ERROR else 3500, anchor_br=True)
+            ms = max(ms, 6000)
+        self._corner_toast(msg, ms)
+
+    def _retry_triggers(self):
+        if self.triggers.start():
+            self.triggers_ok = True
+            self._corner_toast(f"Ready: highlight text, then {self._trigger_text()}.", 4000)
+        else:
+            self.root.after(2000, self._retry_triggers)
 
     def _trigger_worker(self):
         while True:
@@ -1783,69 +1675,32 @@ class App:
             # drop duplicate triggers that piled up
             while not self.trigger_q.empty():
                 self.trigger_q.get_nowait()
-            x, y = cursor_pos()
+            x, y = plat.cursor_pos()
             if source == "clipboard":
-                try:
-                    text = pyperclip.paste().strip()
-                except Exception:
-                    text = ""
+                text = (plat.clipboard_text() or "").strip()
             else:
                 time.sleep(0.05)
-                text = copy_selection()
+                text = plat.copy_selection(CFG.get("restore_clipboard", True))
             self.ui_q.put(("open", text, x, y))
-
-    def _start_hotkey(self):
-        hk = CFG.get("hotkey")
-        if not hk:
-            return
-        try:
-            keyboard.GlobalHotKeys({hk: lambda: self.trigger_q.put("selection")}).start()
-        except Exception as e:
-            print(f"Could not register hotkey {hk!r}: {e}")
-
-    def _start_mouse_hook(self):
-        def win32_filter(msg, data):
-            # Runs inside the low-level mouse hook: must return quickly.
-            if msg == WM_RBUTTONDOWN and key_down(VK_CONTROL) and not key_down(VK_MENU):
-                self._rclick_swallowed = True
-                self.trigger_q.put("selection")
-                self.mouse_listener.suppress_event()
-            elif msg == WM_RBUTTONUP and self._rclick_swallowed:
-                self._rclick_swallowed = False
-                self.mouse_listener.suppress_event()
-            return True
-
-        self.mouse_listener = mouse.Listener(win32_event_filter=win32_filter)
-        self.mouse_listener.start()
 
     def _tray_unload(self):
         threading.Thread(target=lambda: self.ui_q.put(("toast", unload_models_safe())),
                          daemon=True).start()
 
     def _start_tray(self):
+        items = [
+            ("Show window", lambda: self.ui_q.put(("show",)), True),
+            ("Explain clipboard text", lambda: self.trigger_q.put("clipboard"), False),
+            (f"Trigger: {self._trigger_text()}", None, False),
+            ("Settings…", lambda: self.ui_q.put(("settings",)), False),
+            ("Unload model from LM Studio", self._tray_unload, False),
+            ("Open config.json", lambda: plat.open_file(CONFIG_PATH), False),
+            ("Quit", lambda: self.ui_q.put(("quit",)), False),
+        ]
         try:
-            import pystray
-            from PIL import Image, ImageDraw
-        except ImportError:
-            return
-        try:
-            img = Image.open(ICON_ICO)
-        except Exception:  # icon missing: draw a simple blue "?"
-            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)
-            d.ellipse((4, 4, 60, 60), fill=(26, 95, 180, 255))
-            d.text((32, 32), "?", fill="white", anchor="mm")
-        menu = pystray.Menu(
-            pystray.MenuItem("Show window", lambda: self.ui_q.put(("show",)), default=True),
-            pystray.MenuItem("Explain clipboard text", lambda: self.trigger_q.put("clipboard")),
-            pystray.MenuItem(f"Trigger: Ctrl+Right-click or {hotkey_label(CFG.get('hotkey'))}", None, enabled=False),
-            pystray.MenuItem("Settings…", lambda: self.ui_q.put(("settings",))),
-            pystray.MenuItem("Unload model from LM Studio", self._tray_unload),
-            pystray.MenuItem("Open config.json", lambda: os.startfile(CONFIG_PATH)),
-            pystray.MenuItem("Quit", lambda: self.ui_q.put(("quit",))),
-        )
-        self.tray = pystray.Icon("llm_explain", img, "LLM Explain", menu)
-        self.tray.run_detached()
+            self.tray = plat.Tray(ICON_PATH, items)
+        except Exception as e:
+            print(f"Could not create the {plat.TRAY}: {e}")
 
     def _poll(self):
         try:
@@ -1860,13 +1715,11 @@ class App:
                     continue
                 if item[0] == "show":
                     if not (self.window and self.window.show_existing()):
-                        left, top, right, bottom = work_area_at(*cursor_pos())
-                        self._toast("No lookups yet. Highlight text, then Ctrl + Right-click.",
-                                    right - 20, bottom - 20, ms=3000, anchor_br=True)
+                        self._corner_toast(f"No lookups yet. Highlight text, then "
+                                           f"{self._trigger_text()}.", 3000)
                     continue
                 if item[0] == "toast":
-                    left, top, right, bottom = work_area_at(*cursor_pos())
-                    self._toast(item[1], right - 20, bottom - 20, ms=3500, anchor_br=True)
+                    self._corner_toast(item[1], 3500)
                     continue
                 _, text, x, y = item
                 if not text:
@@ -1879,7 +1732,16 @@ class App:
             pass
         self.root.after(50, self._poll)
 
-    def _toast(self, msg, x, y, ms=1800, anchor_br=False):
+    def _corner_toast(self, msg, ms):
+        """A notice in the screen corner next to the tray (Windows) or menu bar (macOS)."""
+        left, top, right, bottom = plat.work_area_at(*plat.cursor_pos())
+        if plat.NOTICE_CORNER == "tr":
+            self._toast(msg, right - 20, top + 8, ms=ms, anchor="tr")
+        else:
+            self._toast(msg, right - 20, bottom - 20, ms=ms, anchor="br")
+
+    def _toast(self, msg, x, y, ms=1800, anchor=None):
+        plat.show_app_quietly()  # macOS: the app may be hidden after the window closed
         tw = tk.Toplevel(self.root)
         tw.overrideredirect(True)
         tw.attributes("-topmost", True)
@@ -1887,19 +1749,20 @@ class App:
         tw.config(bg=pal["border"])
         tk.Label(tw, text=msg, bg=pal["subtle"], fg=pal["text"], padx=14, pady=10,
                  justify="left").pack(padx=1, pady=1)
-        if anchor_br:  # (x, y) is the bottom-right corner
+        if anchor:  # (x, y) is the bottom-right ("br") or top-right ("tr") corner
             tw.update_idletasks()
-            x, y = x - tw.winfo_reqwidth() - 12, y - tw.winfo_reqheight() - 12
+            x -= tw.winfo_reqwidth() + 12
+            y = y - tw.winfo_reqheight() - 12 if anchor == "br" else y - 12
         tw.geometry(f"+{x + 12}+{y + 12}")
         tw.deiconify()
+        tw.lift()
         tw.bind("<Button-1>", lambda e: tw.destroy())
         tw.after(ms, tw.destroy)
 
     def quit(self):
         if self.tray:
             self.tray.stop()
-        if self.mouse_listener:
-            self.mouse_listener.stop()
+        self.triggers.stop()
         self.root.destroy()
         os._exit(0)
 
@@ -1910,13 +1773,20 @@ class App:
 def selftest(out_path):
     """`LLM Explain.exe --selftest <file>`: check the packaged modules load, then exit."""
     lines = []
-    for mod in ("anthropic", "pynput.keyboard", "pynput.mouse", "pystray", "PIL", "pyperclip"):
+    for mod in plat.SELFTEST_MODULES:
         try:
             m = __import__(mod)
             lines.append(f"ok   {mod} {getattr(m, '__version__', '')}")
         except Exception as e:
             lines.append(f"FAIL {mod}: {e}")
-    lines.append(f"icon {'ok' if os.path.exists(ICON_ICO) else 'MISSING'}")
+    try:
+        r = tk.Tk()
+        lines.append(f"ok   tk {r.tk.call('info', 'patchlevel')}")
+        r.destroy()
+    except Exception as e:
+        lines.append(f"FAIL tk: {e}")
+    lines.append(f"icon {'ok' if os.path.exists(ICON_PATH) else 'MISSING'}")
+    lines.append(f"config {CONFIG_PATH}")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -1925,11 +1795,8 @@ def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--selftest":
         selftest(sys.argv[2])
         return
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor DPI: coords match
-    except Exception:
-        user32.SetProcessDPIAware()
-    single_instance_or_exit()
+    plat.setup_process()
+    plat.single_instance_or_exit()
     App().run()
 
 
