@@ -62,8 +62,10 @@ first time). Accessibility access then goes to the app that runs it (Terminal, o
 On a Mac the window shortcuts use ⌘ instead of Ctrl (⌘W closes a tab, ⌘1/2/3 set the length).
 Control + right-click means holding Control while you right-click (two-finger click on a trackpad);
 Control + a normal click still opens the usual context menu. API keys go to the **Keychain**
-(service "LLM Explain"). After rebuilding the app, macOS may ask for Accessibility again, because
-each build has a new ad-hoc signature: turn LLM Explain off and on again in that list.
+(service "LLM Explain"). The build signs the app so that macOS keeps the Accessibility
+permission across rebuilds (it matches the bundle identifier). If you installed a build from
+before that change, remove LLM Explain from the Accessibility list with **−** and add it again
+once.
 
 ## Model providers
 
@@ -117,6 +119,8 @@ Plain right-click (without Ctrl) works normally everywhere.
 - `max_tabs`: the most tabs kept open (default 8); the oldest finished tab closes first.
 - `font_size`: text size (default 11). On a Mac 3 is added, so it looks the same size as on Windows.
 - `always_on_top`: `false` lets other windows cover the explanation window.
+- `drop_back`: when you click outside the window it drops behind the other windows (and comes back
+  on top when you click it or look something up). `false` keeps it on top until you close it.
 - `reasoning_allowance`: extra tokens for models that "think" before answering (e.g. Gemma 4). Raise it if answers come back empty.
 - `restore_clipboard`: put your previous clipboard text back after grabbing the selection.
 - `system_prompt`: change the style of the explanations (e.g. "answer in Spanish", "assume a PhD-level reader").

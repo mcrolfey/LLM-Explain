@@ -6,6 +6,7 @@ to that loop and their callbacks run on the main thread. They only put work on a
 """
 
 import fcntl
+import logging
 import os
 import subprocess
 import time
@@ -22,6 +23,8 @@ NOTICE_CORNER = "tr"  # startup notice near the menu bar icon: top-right
 SUBPROCESS_FLAGS = {}
 
 SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/LLM Explain")
+LOG_PATH = os.path.expanduser("~/Library/Logs/LLM Explain.log")
+LOG = logging.getLogger("llm_explain")
 
 _M_SHIFT = Quartz.kCGEventFlagMaskShift
 _M_CTRL = Quartz.kCGEventFlagMaskControl
@@ -292,6 +295,10 @@ def open_file(path):
     subprocess.Popen(["open", "-t", path])
 
 
+def open_accessibility_settings():
+    subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
+
+
 def lms_cli():
     path = os.path.join(os.path.expanduser("~"), ".lmstudio", "bin", "lms")
     return path if os.path.exists(path) else None
@@ -337,6 +344,7 @@ class Triggers:
                                       Quartz.kCGEventTapOptionDefault, mask, self._callback, None)
         if not tap:
             return False
+        LOG.info("event tap created")
         self.tap = tap
         self._source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
         Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetMain(), self._source, Quartz.kCFRunLoopCommonModes)
@@ -345,11 +353,20 @@ class Triggers:
 
     def _callback(self, proxy, typ, event, refcon):
         # Runs on the main thread for every key press and right-click: keep it short.
+        try:
+            return self._handle(typ, event)
+        except Exception:
+            LOG.exception("event tap callback failed")
+            return event
+
+    def _handle(self, typ, event):
         if typ in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+            LOG.warning("event tap was disabled by macOS (%s); re-enabling", typ)
             Quartz.CGEventTapEnable(self.tap, True)
             return event
         flags = Quartz.CGEventGetFlags(event)
         if typ == Quartz.kCGEventRightMouseDown:
+            LOG.info("right-click seen, control=%s option=%s", bool(flags & _M_CTRL), bool(flags & _M_ALT))
             if self.ctrl_right_click and flags & _M_CTRL and not flags & _M_ALT:
                 self._rclick_swallowed = True
                 self.on_trigger()

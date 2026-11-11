@@ -31,6 +31,12 @@ with open(p, "wb") as f:
     plistlib.dump(info, f)
 PY
 codesign --force --deep --sign - "$APP"
+# Stable designated requirement: macOS ties the Accessibility permission to it, so the
+# permission survives rebuilds (an ad-hoc signature alone changes with every build).
+# Trade-off: any app signed with this bundle identifier would match it.
+codesign --force --sign - \
+  -r='designated => identifier "io.github.mcrolfey.llm-explain"' "$APP"
+codesign --verify --deep --strict "$APP"
 
 "$APP/Contents/MacOS/LLM Explain" --selftest dist/selftest.txt
 cat dist/selftest.txt

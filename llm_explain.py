@@ -18,6 +18,8 @@ macOS: run start_llm_explain.command, or build the app with build_mac.sh. Quit f
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import queue
 import re
@@ -31,6 +33,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 IS_MAC = sys.platform == "darwin"
+LOG = logging.getLogger("llm_explain")
 if IS_MAC:
     import mac_support as plat
 else:
@@ -62,6 +65,7 @@ DEFAULT_CONFIG = {
     "auto_unload_minutes": 0,
     "max_tabs": 8,
     "always_on_top": True,
+    "drop_back": True,
     "reasoning_allowance": 2500,
     "system_prompt": (
         "You are a concise explainer. The user highlighted some text in another program and "
@@ -185,7 +189,10 @@ def _http_error_text(e):
         body = ""
     msg = body
     try:
-        err = json.loads(body).get("error", body)
+        obj = json.loads(body)
+        if isinstance(obj, list) and obj:  # Gemini wraps the error in a list
+            obj = obj[0]
+        err = obj.get("error", body)
         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
     except Exception:
         pass
@@ -193,6 +200,18 @@ def _http_error_text(e):
             404: "Check the base URL and model name in Settings.",
             429: "Rate limit or quota reached. Wait a moment or check your account."}.get(e.code, "")
     return f"HTTP {e.code}: {msg.strip()[:300]}" + (f"\n{hint}" if hint else "")
+
+
+# Model ids that can't answer a chat in text (speech, images, video, embeddings, live audio...).
+# Providers list them alongside chat models; picking one makes every request fail.
+_NON_CHAT = re.compile(
+    r"(^|[-_/.])(tts|embed\w*|embedding|imagen|veo|image|images|aqa|live|native-audio|audio|"
+    r"transcribe|whisper|dall-e|moderation|realtime|sora|lyria|computer-use|robotics)([-_/.]|$)"
+    r"|^(babbage|davinci)-|^tts-|^gpt-image", re.I)
+
+
+def is_chat_model(model_id):
+    return bool(model_id) and not _NON_CHAT.search(model_id.replace("models/", ""))
 
 
 def list_models(prov):
@@ -208,7 +227,7 @@ def list_models(prov):
     path = "/v1/models" if t == "lmstudio" else "/models"
     data = _get_json(path, timeout=15, base=prov.get("base_url"), headers=headers)
     ids = [m.get("id") for m in data.get("data", data.get("models", [])) if isinstance(m, dict)]
-    return sorted(i.replace("models/", "") for i in ids if i and "embed" not in i.lower())
+    return sorted(i.replace("models/", "") for i in ids if is_chat_model(i))
 
 
 def resolve_model(prov=None):
@@ -289,6 +308,9 @@ def _stream_openai(messages, model, cancel, max_tokens, prov):
             if e.code == 400 and "temperature" in low and "temperature" in payload:
                 payload.pop("temperature")
                 continue
+            if e.code in (400, 404) and not is_chat_model(model):
+                text += (f"\n\"{model}\" is a speech/image/embedding model, which can't answer "
+                         "in text. Open Settings, press Fetch and choose a chat model.")
             raise RuntimeError(text) from None
     if resp is None:
         raise RuntimeError("The API rejected the request parameters.")
@@ -859,8 +881,13 @@ class ExplainWindow:
         w = self.win = tk.Toplevel(root, bg=p["bg"])
         w.withdraw()
         w.title("LLM Explain")
-        if CFG.get("always_on_top", True):
-            w.attributes("-topmost", True)
+        self.on_top = bool(CFG.get("always_on_top", True))
+        self._topmost = None
+        self._focus_job = None
+        self.set_on_top(self.on_top)
+        # Click outside the window -> it drops behind; click it or look something up -> back on top
+        w.bind("<FocusIn>", lambda e: self._focus_changed(), add="+")
+        w.bind("<FocusOut>", lambda e: self._focus_changed(), add="+")
         w.protocol("WM_DELETE_WINDOW", self.hide)
         w.bind("<Escape>", lambda e: self.hide())
         w.bind(f"<{MOD}-w>", lambda e: self.active and self.close_tab(self.active))
@@ -1198,9 +1225,35 @@ class ExplainWindow:
             plat.style_titlebar(w, self.pal, self.dark)
             self.styled = True
         plat.activate_app()  # macOS: take focus from the app the text was selected in
+        self.set_on_top(self.on_top)
         w.lift()
         w.focus_force()
         self.entry.focus_set()
+
+    def set_on_top(self, on):
+        if on != self._topmost:
+            self.win.attributes("-topmost", bool(on))
+            self._topmost = on
+
+    def _focus_changed(self):
+        # FocusOut also fires when focus just moves between widgets; check once it settles
+        if self._focus_job:
+            self.win.after_cancel(self._focus_job)
+        self._focus_job = self.win.after(150, self._check_focus)
+
+    def _check_focus(self):
+        self._focus_job = None
+        if not CFG.get("drop_back", True) or self.win.state() != "normal":
+            return  # (lowering a hidden window would show it again on macOS)
+        try:
+            inside = self.win.focus_get() is not None  # None: another app has focus
+        except (KeyError, tk.TclError):
+            inside = True  # focus is in one of our popup menus
+        if inside:
+            self.set_on_top(self.on_top)
+        else:
+            self.set_on_top(False)
+            self.win.lower()  # behind the window that was clicked
 
     def show_existing(self):
         if self.tabs:
@@ -1630,6 +1683,10 @@ class App:
         self.triggers = plat.Triggers(CFG.get("hotkey"), CFG.get("ctrl_right_click", True),
                                       lambda: self.trigger_q.put("selection"))
         self.triggers_ok = self.triggers.start()
+        LOG.info("start: shortcut %s, accessibility=%s, hotkey=%r, ctrl_right_click=%s",
+                 "active" if self.triggers_ok else "NOT active (waiting for permission)",
+                 self.triggers.has_permission(), CFG.get("hotkey"), CFG.get("ctrl_right_click", True))
+        self._retries = 0
         if not self.triggers_ok:
             # macOS: no Accessibility permission yet. Ask once, then retry until it's granted.
             self.triggers.has_permission(prompt=True)
@@ -1663,7 +1720,9 @@ class App:
         self._corner_toast(msg, ms)
 
     def _retry_triggers(self):
+        self._retries += 1
         if self.triggers.start():
+            LOG.info("shortcut active after permission was granted")
             self.triggers_ok = True
             self._corner_toast(f"Ready: highlight text, then {self._trigger_text()}.", 4000)
         else:
@@ -1676,11 +1735,13 @@ class App:
             while not self.trigger_q.empty():
                 self.trigger_q.get_nowait()
             x, y = plat.cursor_pos()
+            LOG.info("trigger: %s", source)
             if source == "clipboard":
                 text = (plat.clipboard_text() or "").strip()
             else:
                 time.sleep(0.05)
                 text = plat.copy_selection(CFG.get("restore_clipboard", True))
+            LOG.info("copied %d characters", len(text))
             self.ui_q.put(("open", text, x, y))
 
     def _tray_unload(self):
@@ -1695,6 +1756,10 @@ class App:
             ("Settings…", lambda: self.ui_q.put(("settings",)), False),
             ("Unload model from LM Studio", self._tray_unload, False),
             ("Open config.json", lambda: plat.open_file(CONFIG_PATH), False),
+        ] + ([
+            ("Open Accessibility settings…", plat.open_accessibility_settings, False),
+            ("Open log", lambda: plat.open_file(plat.LOG_PATH), False),
+        ] if IS_MAC else []) + [
             ("Quit", lambda: self.ui_q.put(("quit",)), False),
         ]
         try:
@@ -1791,10 +1856,26 @@ def selftest(out_path):
         f.write("\n".join(lines) + "\n")
 
 
+def setup_logging():
+    """macOS: ~/Library/Logs/LLM Explain.log (menu bar → Open log). Windows: no log file."""
+    path = getattr(plat, "LOG_PATH", None)
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        h = logging.handlers.RotatingFileHandler(path, maxBytes=200_000, backupCount=1, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOG.addHandler(h)
+        LOG.setLevel(logging.INFO)
+    except OSError:
+        pass
+
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--selftest":
         selftest(sys.argv[2])
         return
+    setup_logging()
     plat.setup_process()
     plat.single_instance_or_exit()
     App().run()
